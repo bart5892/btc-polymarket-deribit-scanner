@@ -1,3 +1,9 @@
+import streamlit as st
+st.set_page_config(page_title="SCANNER TEST V9", layout="wide")
+st.title("SCANNER TEST V9")
+st.write("If you see this, Railway is deploying the newest app.py.")
+st.stop()
+
 st.set_page_config(page_title="BTC Scanner V5", layout="wide")
 st.title("BTC Scanner V5")
 st.caption("SCANNER V5 - live matched scanner build")
