@@ -1,4 +1,3 @@
-BTC Scanner Fresh Deploy
 import streamlit as st
 st.set_page_config(page_title="SCANNER TEST V9", layout="wide")
 st.title("SCANNER TEST V9")
