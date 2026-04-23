@@ -1,3 +1,6 @@
+st.set_page_config(page_title="BTC Scanner V5", layout="wide")
+st.title("BTC Scanner V5")
+st.caption("SCANNER V5 - live matched scanner build")
 import ast
 import math
 import re
