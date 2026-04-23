@@ -1,11 +1,12 @@
+import ast
 import re
-from typing import List, Optional
+from typing import Optional
 
 import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="BTC Polymarket Deribit Scanner", layout="wide")
+st.set_page_config(page_title="BTC Polymarket Debugger", layout="wide")
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 DERIBIT_BASE = "https://www.deribit.com/api/v2"
@@ -17,271 +18,239 @@ def safe_get(url: str, params: Optional[dict] = None):
     return r.json()
 
 
+def parse_maybe_list(value):
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            return ast.literal_eval(value)
+        except Exception:
+            return []
+    return []
+
+
+def parse_yes_mid(outcomes, outcome_prices):
+    outcomes = parse_maybe_list(outcomes)
+    outcome_prices = parse_maybe_list(outcome_prices)
+
+    if not outcomes or not outcome_prices:
+        return None
+
+    for outcome, price in zip(outcomes, outcome_prices):
+        if str(outcome).strip().lower() == "yes":
+            try:
+                return float(price)
+            except Exception:
+                return None
+    return None
+
+
+def is_btc_text(text: str) -> bool:
+    t = (text or "").lower()
+    return any(x in t for x in ["bitcoin", "btc", "xbt"])
+
+
+def looks_like_price_question(text: str) -> bool:
+    t = (text or "").lower()
+    return any(x in t for x in ["above", "below", "over", "under", "reach", "hit"]) and (
+        "$" in t or re.search(r"\b\d{2,3}(?:,\d{3})+\b", t)
+    )
+
+
+def parse_direction(text: str):
+    t = (text or "").lower()
+    if "above" in t or "over" in t:
+        return "Above/Over"
+    if "below" in t or "under" in t:
+        return "Below/Under"
+    if "reach" in t or "hit" in t:
+        return "Reach/Hit"
+    return ""
+
+
+def parse_strike(text: str):
+    if not text:
+        return None
+    m = re.search(r"\$([\d,]+(?:\.\d+)?)", text)
+    if not m:
+        m = re.search(r"\b([\d]{2,3}(?:,[\d]{3})+)\b", text)
+    if not m:
+        return None
+    try:
+        return float(m.group(1).replace(",", ""))
+    except Exception:
+        return None
+
+
 @st.cache_data(ttl=120)
-def fetch_polymarket_events(limit: int = 200) -> list:
+def fetch_active_events(limit=200, offset=0):
     return safe_get(
         f"{GAMMA_BASE}/events",
         params={
             "active": "true",
             "closed": "false",
             "limit": limit,
+            "offset": offset,
+            "order": "volume24hr",
+            "ascending": "false",
         },
     )
 
 
-def extract_markets_from_events(events: list) -> list:
-    markets = []
-    for event in events:
-        event_title = event.get("title", "")
-        for market in event.get("markets", []) or []:
-            item = {
-                "event_title": event_title,
-                "market_id": market.get("id"),
-                "question": market.get("question") or market.get("title") or "",
-                "end_date_iso": market.get("endDate"),
-                "volume": market.get("volume") or market.get("volumeNum"),
-                "liquidity": market.get("liquidity") or market.get("liquidityNum"),
-                "slug": market.get("slug"),
-                "outcomes": market.get("outcomes"),
-                "outcome_prices": market.get("outcomePrices"),
-            }
-            markets.append(item)
-    return markets
-
-
-def parse_yes_mid(outcomes, outcome_prices) -> Optional[float]:
-    try:
-        if isinstance(outcomes, str):
-            outcomes = eval(outcomes)
-        if isinstance(outcome_prices, str):
-            outcome_prices = eval(outcome_prices)
-        if not outcomes or not outcome_prices:
-            return None
-        for outcome, price in zip(outcomes, outcome_prices):
-            if str(outcome).strip().lower() == "yes":
-                return float(price)
-    except Exception:
-        return None
-    return None
-
-
-def is_btc_market(text: str) -> bool:
-    t = (text or "").lower()
-    return "bitcoin" in t or "btc" in t
-
-
-def is_above_below_market(text: str) -> bool:
-    t = (text or "").lower()
-    return ("above" in t or "below" in t) and "$" in t
-
-
-def parse_direction(text: str) -> Optional[str]:
-    t = (text or "").lower()
-    if "above" in t:
-        return "Above"
-    if "below" in t:
-        return "Below"
-    return None
-
-
-def parse_strike(text: str) -> Optional[float]:
-    if not text:
-        return None
-    m = re.search(r"\$([\d,]+(?:\.\d+)?)", text)
-    if not m:
-        return None
-    return float(m.group(1).replace(",", ""))
-
-
 @st.cache_data(ttl=120)
-def load_live_polymarket_btc_markets() -> pd.DataFrame:
-    events = fetch_polymarket_events(limit=200)
-    raw_markets = extract_markets_from_events(events)
-
-    rows = []
-    for m in raw_markets:
-        question = m["question"]
-        if not is_btc_market(question) and not is_btc_market(m["event_title"]):
-            continue
-        if not is_above_below_market(question):
-            continue
-
-        direction = parse_direction(question)
-        strike = parse_strike(question)
-        yes_mid = parse_yes_mid(m["outcomes"], m["outcome_prices"])
-
-        if direction is None or strike is None:
-            continue
-
-        rows.append(
-            {
-                "title": question,
-                "direction": direction,
-                "strike": strike,
-                "expiry": m["end_date_iso"],
-                "polymarket_yes_mid": yes_mid,
-                "volume": m["volume"],
-                "liquidity": m["liquidity"],
-                "slug": m["slug"],
-            }
-        )
-
-    df = pd.DataFrame(rows)
-
-    if df.empty:
-        return df
-
-    df = df.sort_values(by=["expiry", "strike"], ascending=[True, True]).reset_index(drop=True)
-    return df
-
-
-@st.cache_data(ttl=120)
-def load_deribit_option_feed() -> pd.DataFrame:
+def fetch_deribit_summary():
     payload = safe_get(
         f"{DERIBIT_BASE}/public/get_book_summary_by_currency",
         params={"currency": "BTC", "kind": "option"},
     )
-    results = payload.get("result", [])
+    return pd.DataFrame(payload.get("result", []))
 
+
+def extract_market_rows(events):
     rows = []
-    for x in results:
-        rows.append(
-            {
-                "instrument_name": x.get("instrument_name"),
-                "bid_price": x.get("bid_price"),
-                "ask_price": x.get("ask_price"),
-                "mid_price": x.get("mid_price"),
-                "open_interest": x.get("open_interest"),
-                "volume": x.get("volume"),
-                "underlying_price": x.get("underlying_price"),
+    for event in events:
+        event_title = event.get("title", "")
+        event_slug = event.get("slug", "")
+        event_id = event.get("id")
+        markets = event.get("markets", []) or []
+
+        for market in markets:
+            question = market.get("question") or market.get("title") or ""
+            combined_text = f"{event_title} || {question}"
+
+            if not is_btc_text(combined_text):
+                continue
+
+            yes_mid = parse_yes_mid(market.get("outcomes"), market.get("outcomePrices"))
+
+            row = {
+                "event_id": event_id,
+                "event_title": event_title,
+                "event_slug": event_slug,
+                "market_id": market.get("id"),
+                "question": question,
+                "combined_text": combined_text,
+                "end_date": market.get("endDate"),
+                "active": market.get("active"),
+                "closed": market.get("closed"),
+                "archived": market.get("archived"),
+                "volume": market.get("volume") or market.get("volumeNum"),
+                "liquidity": market.get("liquidity") or market.get("liquidityNum"),
+                "yes_mid": yes_mid,
+                "direction_guess": parse_direction(question),
+                "strike_guess": parse_strike(question),
+                "looks_like_price_question": looks_like_price_question(question),
+                "market_slug": market.get("slug"),
+                "outcomes": str(market.get("outcomes")),
+                "outcome_prices": str(market.get("outcomePrices")),
             }
-        )
+            rows.append(row)
 
     return pd.DataFrame(rows)
 
 
-def nearest_deribit_mid(strike: float, deribit_df: pd.DataFrame) -> Optional[float]:
-    if deribit_df.empty or strike is None:
-        return None
-
-    tmp = deribit_df.copy()
-    tmp = tmp[tmp["instrument_name"].astype(str).str.contains("-C|-P", regex=True, na=False)]
-    if tmp.empty:
-        return None
-
-    extracted = tmp["instrument_name"].str.extract(r"BTC-\d{1,2}[A-Z]{3}\d{2}-(\d+)-([CP])")
-    tmp["parsed_strike"] = pd.to_numeric(extracted[0], errors="coerce")
-    tmp = tmp.dropna(subset=["parsed_strike"])
-    if tmp.empty:
-        return None
-
-    tmp["distance"] = (tmp["parsed_strike"] - strike).abs()
-    tmp = tmp.sort_values("distance")
-    row = tmp.iloc[0]
-
-    if pd.notna(row["mid_price"]):
-        return float(row["mid_price"])
-    if pd.notna(row["bid_price"]) and pd.notna(row["ask_price"]):
-        return float((row["bid_price"] + row["ask_price"]) / 2)
-    return None
-
-
 def main():
-    st.title("BTC Polymarket Deribit Scanner")
+    st.title("BTC Polymarket Debugger")
     st.caption(
-        "Live BTC-related Polymarket markets plus a live Deribit options feed. Current Deribit column is a live placeholder feed, not yet a true terminal probability model."
+        "Debug build: show all live BTC-related Polymarket markets first, then inspect likely price-trigger contracts before tightening filters."
     )
 
-    left, right = st.columns([2, 1])
-
-    with st.spinner("Loading live Polymarket BTC markets..."):
-        poly_df = load_live_polymarket_btc_markets()
-
-    with st.spinner("Loading live Deribit BTC options feed..."):
-        deribit_df = load_deribit_option_feed()
-
     with st.sidebar:
-        st.header("Filters")
-        direction_filter = st.multiselect(
-            "Direction",
-            options=["Above", "Below"],
-            default=["Above", "Below"],
-        )
-        min_liquidity = st.number_input("Minimum liquidity", min_value=0.0, value=0.0, step=100.0)
-        min_volume = st.number_input("Minimum volume", min_value=0.0, value=0.0, step=100.0)
+        st.header("Controls")
+        pages_to_pull = st.slider("Event pages to pull", min_value=1, max_value=5, value=3, step=1)
+        events_per_page = st.slider("Events per page", min_value=50, max_value=200, value=100, step=50)
+        show_only_price_like = st.checkbox("Show only likely BTC price-trigger questions", value=False)
 
-    if poly_df.empty:
-        st.warning("No live BTC above/below Polymarket markets were found with the current filters.")
+    all_events = []
+    for i in range(pages_to_pull):
+        offset = i * events_per_page
+        batch = fetch_active_events(limit=events_per_page, offset=offset)
+        if not batch:
+            break
+        all_events.extend(batch)
+
+    btc_df = extract_market_rows(all_events)
+
+    deribit_df = fetch_deribit_summary()
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Active events pulled", len(all_events))
+    c2.metric("BTC-related markets found", len(btc_df))
+    c3.metric("Deribit BTC options loaded", len(deribit_df))
+
+    if btc_df.empty:
+        st.warning("No BTC-related markets were found in the pulled event sample.")
         return
 
-    poly_df["polymarket_yes_mid"] = pd.to_numeric(poly_df["polymarket_yes_mid"], errors="coerce")
-    poly_df["liquidity"] = pd.to_numeric(poly_df["liquidity"], errors="coerce")
-    poly_df["volume"] = pd.to_numeric(poly_df["volume"], errors="coerce")
+    raw_df = btc_df.copy()
 
-    poly_df["deribit_live_mid"] = poly_df["strike"].apply(lambda x: nearest_deribit_mid(x, deribit_df))
+    if show_only_price_like:
+        raw_df = raw_df[raw_df["looks_like_price_question"] == True].copy()
 
-    filtered = poly_df[
-        poly_df["direction"].isin(direction_filter)
-        & (poly_df["liquidity"].fillna(0) >= min_liquidity)
-        & (poly_df["volume"].fillna(0) >= min_volume)
-    ].copy()
+    raw_df = raw_df.sort_values(
+        by=["looks_like_price_question", "liquidity", "volume"],
+        ascending=[False, False, False],
+    )
 
-    filtered["live_gap_placeholder"] = filtered["deribit_live_mid"] - filtered["polymarket_yes_mid"]
+    st.subheader("Raw BTC-related Polymarket markets")
+    st.dataframe(
+        raw_df[
+            [
+                "event_title",
+                "question",
+                "direction_guess",
+                "strike_guess",
+                "looks_like_price_question",
+                "yes_mid",
+                "liquidity",
+                "volume",
+                "end_date",
+                "market_slug",
+            ]
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
 
-    display = filtered[
-        [
-            "title",
-            "direction",
-            "strike",
-            "expiry",
-            "polymarket_yes_mid",
-            "deribit_live_mid",
-            "live_gap_placeholder",
-            "volume",
-            "liquidity",
-            "slug",
-        ]
-    ].copy()
+    likely_df = btc_df[btc_df["looks_like_price_question"] == True].copy()
 
-    display["strike"] = display["strike"].map(lambda x: f"${x:,.0f}" if pd.notna(x) else "")
-    display["polymarket_yes_mid"] = display["polymarket_yes_mid"].map(lambda x: f"{x:.1%}" if pd.notna(x) else "")
-    display["deribit_live_mid"] = display["deribit_live_mid"].map(lambda x: f"{x:.4f}" if pd.notna(x) else "")
-    display["live_gap_placeholder"] = display["live_gap_placeholder"].map(lambda x: f"{x:+.4f}" if pd.notna(x) else "")
-    display["volume"] = display["volume"].map(lambda x: f"{x:,.0f}" if pd.notna(x) else "")
-    display["liquidity"] = display["liquidity"].map(lambda x: f"{x:,.0f}" if pd.notna(x) else "")
+    st.subheader("Likely BTC price-trigger subset")
+    if likely_df.empty:
+        st.info("No likely BTC price-trigger markets were detected in this sample.")
+    else:
+        likely_df = likely_df.sort_values(by=["liquidity", "volume"], ascending=[False, False])
+        st.dataframe(
+            likely_df[
+                [
+                    "event_title",
+                    "question",
+                    "direction_guess",
+                    "strike_guess",
+                    "yes_mid",
+                    "liquidity",
+                    "volume",
+                    "end_date",
+                    "market_slug",
+                ]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
 
-    with left:
-        st.subheader("Live market table")
-        st.dataframe(display, use_container_width=True, hide_index=True)
-
-        st.subheader("How to read this")
+    with st.expander("Debug notes"):
         st.markdown(
             """
-- **Polymarket yes mid** is live Polymarket market pricing derived from the Yes outcome price.
-- **Deribit live mid** is currently a live placeholder value from the nearest BTC option instrument by strike.
-- **Live gap placeholder** is not yet a valid probability edge; it is only a temporary live-feed comparison column.
-- The next step is to replace this placeholder with a true terminal probability proxy from Deribit.
+- This app intentionally shows **all BTC-related live Polymarket markets** first.
+- The purpose is to inspect the actual wording Polymarket is using right now.
+- Once we confirm the real title patterns, we can tighten the parser for above/below/reach/hit contracts.
+- Deribit is loaded only as a sanity check in this debugging build.
             """
         )
 
-    with right:
-        st.subheader("Summary")
-        st.metric("Live Polymarket BTC markets", len(filtered))
-        st.metric("Deribit BTC options loaded", len(deribit_df))
-        st.metric(
-            "Avg Polymarket yes mid",
-            f"{filtered['polymarket_yes_mid'].mean():.1%}" if len(filtered) and filtered["polymarket_yes_mid"].notna().any() else "N/A",
-        )
-
-        st.subheader("Next build")
-        st.markdown(
-            """
-1. Tighten title parsing for only true BTC above/below contracts.
-2. Map each market to the nearest Deribit expiry.
-3. Build terminal digital probability approximation.
-4. Replace placeholder live gap with modeled probability edge.
-            """
-        )
+    with st.expander("Example raw titles"):
+        sample_titles = btc_df["question"].dropna().astype(str).head(50).tolist()
+        for t in sample_titles:
+            st.write("-", t)
 
 
 if __name__ == "__main__":
