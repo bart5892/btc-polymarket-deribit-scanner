@@ -1,4 +1,6 @@
 import ast
+import json
+import math
 import re
 from datetime import datetime, timezone
 from typing import Optional
@@ -7,10 +9,12 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="BTC Polymarket Deribit Scanner", layout="wide")
+st.set_page_config(page_title="BTC Polymarket Deribit Scanner vNext", layout="wide")
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
+CLOB_BASE = "https://clob.polymarket.com"
 DERIBIT_BASE = "https://www.deribit.com/api/v2"
+DEFAULT_NOTIONAL_USD = 10000.0
 
 
 def safe_get(url: str, params: Optional[dict] = None):
@@ -26,22 +30,40 @@ def parse_maybe_list(value):
         try:
             return ast.literal_eval(value)
         except Exception:
-            return []
+            try:
+                return json.loads(value)
+            except Exception:
+                return []
     return []
 
 
-def parse_yes_mid(outcomes, outcome_prices):
-    outcomes = parse_maybe_list(outcomes)
-    outcome_prices = parse_maybe_list(outcome_prices)
-    if not outcomes or not outcome_prices:
-        return None
-    for outcome, price in zip(outcomes, outcome_prices):
-        if str(outcome).strip().lower() == "yes":
-            try:
-                return float(price)
-            except Exception:
-                return None
-    return None
+def first_numeric(value, default=None):
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def best_bid_ask_from_book(book):
+    bids = book.get("bids", []) or []
+    asks = book.get("asks", []) or []
+
+    best_bid = None
+    best_bid_size = None
+    best_ask = None
+    best_ask_size = None
+
+    if bids:
+        best_bid = first_numeric(bids[0].get("price"))
+        best_bid_size = first_numeric(bids[0].get("size"))
+
+    if asks:
+        best_ask = first_numeric(asks[0].get("price"))
+        best_ask_size = first_numeric(asks[0].get("size"))
+
+    return best_bid, best_bid_size, best_ask, best_ask_size
 
 
 def is_btc_text(text: str) -> bool:
@@ -90,6 +112,55 @@ def parse_end_date(value) -> Optional[pd.Timestamp]:
         return None
 
 
+def parse_token_ids(market) -> list:
+    candidates = [
+        market.get("clobTokenIds"),
+        market.get("clobTokenIdsStr"),
+        market.get("outcomeTokenIds"),
+        market.get("tokenIds"),
+    ]
+    for c in candidates:
+        parsed = parse_maybe_list(c)
+        if parsed and len(parsed) >= 2:
+            return [str(parsed[0]), str(parsed[1])]
+    return []
+
+
+def parse_outcomes(market) -> list:
+    candidates = [
+        market.get("outcomes"),
+        market.get("outcomeNames"),
+    ]
+    for c in candidates:
+        parsed = parse_maybe_list(c)
+        if parsed and len(parsed) >= 2:
+            return [str(x) for x in parsed]
+    return ["Yes", "No"]
+
+
+def map_yes_no_tokens(market):
+    token_ids = parse_token_ids(market)
+    outcomes = parse_outcomes(market)
+
+    yes_token = None
+    no_token = None
+
+    if len(token_ids) >= 2 and len(outcomes) >= 2:
+        for outcome, token in zip(outcomes, token_ids):
+            o = str(outcome).strip().lower()
+            if o == "yes":
+                yes_token = token
+            elif o == "no":
+                no_token = token
+
+    if yes_token is None and len(token_ids) >= 1:
+        yes_token = token_ids[0]
+    if no_token is None and len(token_ids) >= 2:
+        no_token = token_ids[1]
+
+    return yes_token, no_token
+
+
 @st.cache_data(ttl=120)
 def fetch_active_events(limit=200, offset=0):
     return safe_get(
@@ -123,6 +194,16 @@ def fetch_deribit_summaries():
     return payload.get("result", [])
 
 
+@st.cache_data(ttl=60)
+def fetch_polymarket_book(token_id: str):
+    if not token_id:
+        return {}
+    try:
+        return safe_get(f"{CLOB_BASE}/book", params={"token_id": token_id})
+    except Exception:
+        return {}
+
+
 def build_polymarket_df(pages_to_pull=3, events_per_page=100) -> pd.DataFrame:
     all_events = []
     for i in range(pages_to_pull):
@@ -135,6 +216,7 @@ def build_polymarket_df(pages_to_pull=3, events_per_page=100) -> pd.DataFrame:
     for event in all_events:
         event_title = event.get("title", "")
         event_slug = event.get("slug", "")
+
         for market in event.get("markets", []) or []:
             question = market.get("question") or market.get("title") or ""
             combined = f"{event_title} || {question}"
@@ -143,8 +225,8 @@ def build_polymarket_df(pages_to_pull=3, events_per_page=100) -> pd.DataFrame:
 
             category = classify_question(question)
             strike = parse_strike(question)
-            yes_mid = parse_yes_mid(market.get("outcomes"), market.get("outcomePrices"))
             end_date = parse_end_date(market.get("endDate"))
+            yes_token, no_token = map_yes_no_tokens(market)
 
             rows.append(
                 {
@@ -152,9 +234,9 @@ def build_polymarket_df(pages_to_pull=3, events_per_page=100) -> pd.DataFrame:
                     "event_slug": event_slug,
                     "question": question,
                     "market_slug": market.get("slug"),
+                    "market_id": market.get("id"),
                     "category": category,
                     "strike": strike,
-                    "yes_mid": yes_mid,
                     "liquidity": pd.to_numeric(
                         market.get("liquidity") or market.get("liquidityNum"),
                         errors="coerce",
@@ -165,6 +247,8 @@ def build_polymarket_df(pages_to_pull=3, events_per_page=100) -> pd.DataFrame:
                     ),
                     "end_date": end_date,
                     "looks_like_price_trigger": looks_like_price_trigger(question),
+                    "yes_token_id": yes_token,
+                    "no_token_id": no_token,
                 }
             )
 
@@ -175,7 +259,31 @@ def build_polymarket_df(pages_to_pull=3, events_per_page=100) -> pd.DataFrame:
     df = df[df["looks_like_price_trigger"] == True].copy()
     df = df[df["strike"].notna()].copy()
     df = df[df["category"].notna()].copy()
-    return df.reset_index(drop=True)
+
+    poly_rows = []
+    for _, row in df.iterrows():
+        yes_book = fetch_polymarket_book(row["yes_token_id"]) if pd.notna(row["yes_token_id"]) else {}
+        no_book = fetch_polymarket_book(row["no_token_id"]) if pd.notna(row["no_token_id"]) else {}
+
+        yes_bid, yes_bid_size, yes_ask, yes_ask_size = best_bid_ask_from_book(yes_book)
+        no_bid, no_bid_size, no_ask, no_ask_size = best_bid_ask_from_book(no_book)
+
+        out = row.to_dict()
+        out.update(
+            {
+                "poly_yes_bid": yes_bid,
+                "poly_yes_bid_size": yes_bid_size,
+                "poly_yes_ask": yes_ask,
+                "poly_yes_ask_size": yes_ask_size,
+                "poly_no_bid": no_bid,
+                "poly_no_bid_size": no_bid_size,
+                "poly_no_ask": no_ask,
+                "poly_no_ask_size": no_ask_size,
+            }
+        )
+        poly_rows.append(out)
+
+    return pd.DataFrame(poly_rows).reset_index(drop=True)
 
 
 def build_deribit_df() -> pd.DataFrame:
@@ -201,16 +309,6 @@ def build_deribit_df() -> pd.DataFrame:
     merged["open_interest"] = pd.to_numeric(merged.get("open_interest"), errors="coerce")
     merged["volume"] = pd.to_numeric(merged.get("volume"), errors="coerce")
 
-    merged["usable_mid"] = merged["mid_price"]
-    missing_mid = (
-        merged["usable_mid"].isna()
-        & merged["bid_price"].notna()
-        & merged["ask_price"].notna()
-    )
-    merged.loc[missing_mid, "usable_mid"] = (
-        merged.loc[missing_mid, "bid_price"] + merged.loc[missing_mid, "ask_price"]
-    ) / 2
-
     return merged.reset_index(drop=True)
 
 
@@ -220,7 +318,8 @@ def empty_match():
         "matched_option_type": None,
         "matched_expiry": None,
         "matched_strike": None,
-        "deribit_mid": None,
+        "deribit_bid": None,
+        "deribit_ask": None,
         "deribit_underlying": None,
         "expiry_gap_days": None,
         "strike_gap_pct": None,
@@ -248,11 +347,11 @@ def find_best_deribit_match(row, deribit_df):
     target_end = row["end_date"]
     tmp["expiry_gap_days"] = (tmp["expiration_dt"] - target_end).abs().dt.total_seconds() / 86400.0
     tmp["strike_gap_pct"] = ((tmp["strike"] - row["strike"]).abs() / row["strike"]) * 100.0
-
     tmp["match_score"] = (
         tmp["expiry_gap_days"].fillna(9999) * 1.0
         + tmp["strike_gap_pct"].fillna(9999) * 2.0
     )
+
     tmp = tmp.sort_values(
         ["match_score", "expiry_gap_days", "strike_gap_pct"],
         ascending=[True, True, True],
@@ -267,7 +366,8 @@ def find_best_deribit_match(row, deribit_df):
         "matched_option_type": best.get("option_type"),
         "matched_expiry": best.get("expiration_dt"),
         "matched_strike": best.get("strike"),
-        "deribit_mid": best.get("usable_mid"),
+        "deribit_bid": best.get("bid_price"),
+        "deribit_ask": best.get("ask_price"),
         "deribit_underlying": best.get("underlying_price"),
         "expiry_gap_days": best.get("expiry_gap_days"),
         "strike_gap_pct": best.get("strike_gap_pct"),
@@ -275,162 +375,62 @@ def find_best_deribit_match(row, deribit_df):
     }
 
 
-def main():
-    st.title("BTC Polymarket Deribit Scanner")
-    st.caption(
-        "Live scanner for BTC price-trigger Polymarket markets with nearest Deribit option matching. "
-        "Current Deribit output is a matching proxy, not yet a final terminal probability model."
-    )
+def choose_polymarket_leg(row):
+    if row["category"] in ["Above/Over", "Reach/Hit", "Below/Under"]:
+        return {
+            "poly_side": "BUY YES",
+            "poly_token_id": row.get("yes_token_id"),
+            "poly_entry_price": row.get("poly_yes_ask"),
+            "poly_exit_reference": row.get("poly_yes_bid"),
+            "poly_price_label": "YES ask",
+        }
 
-    with st.sidebar:
-        st.header("Filters")
-        min_liquidity = st.number_input(
-            "Minimum liquidity", min_value=0.0, value=5000.0, step=1000.0
-        )
-        min_volume = st.number_input(
-            "Minimum volume", min_value=0.0, value=1000.0, step=1000.0
-        )
-        categories = st.multiselect(
-            "Contract type",
-            options=["Above/Over", "Below/Under", "Reach/Hit"],
-            default=["Above/Over", "Below/Under", "Reach/Hit"],
-        )
-        max_expiry_gap_days = st.slider(
-            "Max Deribit expiry gap (days)", min_value=1, max_value=30, value=10
-        )
-        max_strike_gap_pct = st.slider(
-            "Max Deribit strike gap (%)", min_value=1, max_value=50, value=15
-        )
-
-    with st.spinner("Loading Polymarket markets..."):
-        poly_df = build_polymarket_df()
-
-    with st.spinner("Loading Deribit instruments and summaries..."):
-        deribit_df = build_deribit_df()
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Polymarket price-trigger markets", len(poly_df))
-    c2.metric("Deribit BTC options loaded", len(deribit_df))
-    c3.metric("Scanner timestamp UTC", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
-
-    if poly_df.empty:
-        st.warning("No BTC price-trigger Polymarket markets found.")
-        return
-
-    matches = poly_df.apply(
-        lambda row: pd.Series(find_best_deribit_match(row, deribit_df)),
-        axis=1,
-    )
-    scanner_df = pd.concat([poly_df, matches], axis=1)
-
-    scanner_df = scanner_df[
-        scanner_df["category"].isin(categories)
-        & (scanner_df["liquidity"].fillna(0) >= min_liquidity)
-        & (scanner_df["volume"].fillna(0) >= min_volume)
-    ].copy()
-
-    scanner_df = scanner_df[
-        scanner_df["expiry_gap_days"].fillna(9999) <= max_expiry_gap_days
-    ].copy()
-
-    scanner_df = scanner_df[
-        scanner_df["strike_gap_pct"].fillna(9999) <= max_strike_gap_pct
-    ].copy()
-
-    if scanner_df.empty:
-        st.info("No rows passed the current filters.")
-        return
-
-    scanner_df["proxy_gap"] = scanner_df["deribit_mid"] - scanner_df["yes_mid"]
-    scanner_df["rank_score"] = (
-        scanner_df["proxy_gap"].fillna(-999) * 100
-        + scanner_df["liquidity"].fillna(0) / 100000
-        + scanner_df["volume"].fillna(0) / 100000
-        - scanner_df["match_score"].fillna(9999) / 100
-    )
-
-    scanner_df = scanner_df.sort_values(
-        by=["rank_score", "liquidity", "volume"],
-        ascending=[False, False, False],
-    ).reset_index(drop=True)
-
-    st.subheader("Scanner table")
-
-    display = scanner_df[
-        [
-            "question",
-            "category",
-            "strike",
-            "end_date",
-            "yes_mid",
-            "matched_instrument",
-            "matched_option_type",
-            "matched_expiry",
-            "matched_strike",
-            "deribit_mid",
-            "proxy_gap",
-            "expiry_gap_days",
-            "strike_gap_pct",
-            "liquidity",
-            "volume",
-            "market_slug",
-        ]
-    ].copy()
-
-    display["strike"] = display["strike"].map(lambda x: f"${x:,.0f}" if pd.notna(x) else "")
-    display["yes_mid"] = display["yes_mid"].map(lambda x: f"{x:.2%}" if pd.notna(x) else "")
-    display["matched_strike"] = display["matched_strike"].map(
-        lambda x: f"${x:,.0f}" if pd.notna(x) else ""
-    )
-    display["deribit_mid"] = display["deribit_mid"].map(
-        lambda x: f"{x:.4f}" if pd.notna(x) else ""
-    )
-    display["proxy_gap"] = display["proxy_gap"].map(
-        lambda x: f"{x:+.4f}" if pd.notna(x) else ""
-    )
-    display["expiry_gap_days"] = display["expiry_gap_days"].map(
-        lambda x: f"{x:.1f}" if pd.notna(x) else ""
-    )
-    display["strike_gap_pct"] = display["strike_gap_pct"].map(
-        lambda x: f"{x:.1f}%" if pd.notna(x) else ""
-    )
-    display["liquidity"] = display["liquidity"].map(
-        lambda x: f"{x:,.0f}" if pd.notna(x) else ""
-    )
-    display["volume"] = display["volume"].map(
-        lambda x: f"{x:,.0f}" if pd.notna(x) else ""
-    )
-    display["end_date"] = pd.to_datetime(
-        display["end_date"], utc=True, errors="coerce"
-    ).dt.strftime("%Y-%m-%d %H:%M UTC")
-    display["matched_expiry"] = pd.to_datetime(
-        display["matched_expiry"], utc=True, errors="coerce"
-    ).dt.strftime("%Y-%m-%d %H:%M UTC")
-
-    st.dataframe(display, use_container_width=True, hide_index=True)
-
-    st.subheader("Method notes")
-    st.markdown(
-        '''
-- Polymarket yes mid comes from the Yes outcome price in the public Gamma market payload.
-- Deribit match uses live BTC option instruments and summary data, then selects the nearest expiry and strike candidate after matching calls to above/reach contracts and puts to below contracts.
-- Proxy gap is only a temporary comparison metric. It is not yet a true terminal digital probability edge.
-- The next version should replace this proxy with a modeled terminal probability from Deribit options around the event expiry and strike.
-        '''
-    )
-
-    st.subheader("Top opportunities snapshot")
-    top = scanner_df.head(10)[
-        ["question", "category", "yes_mid", "deribit_mid", "proxy_gap", "liquidity", "volume"]
-    ].copy()
-    top["yes_mid"] = top["yes_mid"].map(lambda x: f"{x:.2%}" if pd.notna(x) else "")
-    top["deribit_mid"] = top["deribit_mid"].map(lambda x: f"{x:.4f}" if pd.notna(x) else "")
-    top["proxy_gap"] = top["proxy_gap"].map(lambda x: f"{x:+.4f}" if pd.notna(x) else "")
-    top["liquidity"] = top["liquidity"].map(lambda x: f"{x:,.0f}" if pd.notna(x) else "")
-    top["volume"] = top["volume"].map(lambda x: f"{x:,.0f}" if pd.notna(x) else "")
-
-    st.dataframe(top, use_container_width=True, hide_index=True)
+    return {
+        "poly_side": None,
+        "poly_token_id": None,
+        "poly_entry_price": None,
+        "poly_exit_reference": None,
+        "poly_price_label": None,
+    }
 
 
-if __name__ == "__main__":
-    main()
+def choose_deribit_leg(row):
+    if row["category"] in ["Above/Over", "Reach/Hit"]:
+        return {
+            "deribit_side": "BUY CALL",
+            "deribit_entry_price": row.get("deribit_ask"),
+        }
+    if row["category"] == "Below/Under":
+        return {
+            "deribit_side": "BUY PUT",
+            "deribit_entry_price": row.get("deribit_ask"),
+        }
+
+    return {
+        "deribit_side": None,
+        "deribit_entry_price": None,
+    }
+
+
+def compute_trade_metrics(row, notional_usd):
+    poly = choose_polymarket_leg(row)
+    der = choose_deribit_leg(row)
+
+    poly_entry = first_numeric(poly["poly_entry_price"])
+    deribit_entry_btc = first_numeric(der["deribit_entry_price"])
+    spot = first_numeric(row.get("deribit_underlying"))
+
+    poly_shares = None
+    poly_cost_usd = None
+    poly_gross_payout_usd = None
+    poly_net_payoff_usd = None
+
+    if poly_entry is not None and poly_entry > 0:
+        poly_shares = notional_usd / poly_entry
+        poly_cost_usd = poly_shares * poly_entry
+        poly_gross_payout_usd = poly_shares * 1.0
+        poly_net_payoff_usd = poly_gross_payout_usd - poly_cost_usd
+
+    deribit_btc_amount = None
+    deribit_premium_usd = None
+    
