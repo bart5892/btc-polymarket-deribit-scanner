@@ -433,4 +433,284 @@ def compute_trade_metrics(row, notional_usd):
 
     deribit_btc_amount = None
     deribit_premium_usd = None
-    
+    deribit_contracts = None
+
+    if deribit_entry_btc is not None and deribit_entry_btc > 0 and spot is not None and spot > 0:
+        deribit_premium_usd = deribit_entry_btc * spot
+        deribit_btc_amount = notional_usd / spot
+        deribit_contracts = deribit_btc_amount
+
+    total_cost_proxy = 0.0
+    if poly_cost_usd is not None:
+        total_cost_proxy += poly_cost_usd
+    if deribit_premium_usd is not None and deribit_btc_amount is not None:
+        total_cost_proxy += deribit_entry_btc * deribit_btc_amount * spot
+
+    event_payoff_probability_proxy = None
+    if poly_entry is not None:
+        event_payoff_probability_proxy = 1.0 - poly_entry
+
+    trade_expression = None
+    if (
+        poly["poly_side"]
+        and poly_entry is not None
+        and poly_shares is not None
+        and der["deribit_side"]
+        and deribit_entry_btc is not None
+        and deribit_btc_amount is not None
+        and row.get("matched_instrument")
+    ):
+        trade_expression = (
+            f'{poly["poly_side"]} on Polymarket @ {poly_entry:.3f} '
+            f'for ~{poly_shares:,.0f} shares; '
+            f'{der["deribit_side"]} {row.get("matched_instrument")} @ {deribit_entry_btc:.4f} BTC '
+            f'for ~{deribit_btc_amount:.4f} BTC notional'
+        )
+
+    return {
+        "poly_side": poly["poly_side"],
+        "poly_token_id": poly["poly_token_id"],
+        "poly_entry_price": poly_entry,
+        "poly_exit_reference": poly["poly_exit_reference"],
+        "poly_shares_for_10k": poly_shares,
+        "poly_cost_usd_for_10k": poly_cost_usd,
+        "poly_gross_payout_usd_for_10k": poly_gross_payout_usd,
+        "poly_net_payoff_usd_for_10k": poly_net_payoff_usd,
+        "deribit_side": der["deribit_side"],
+        "deribit_entry_price_btc": deribit_entry_btc,
+        "deribit_option_premium_usd_per_btc": deribit_premium_usd,
+        "deribit_contract_size_btc": 1.0 if deribit_entry_btc is not None else None,
+        "deribit_contracts_for_10k": deribit_contracts,
+        "combined_cost_proxy_usd_for_10k": total_cost_proxy if total_cost_proxy > 0 else None,
+        "payoff_probability_proxy": event_payoff_probability_proxy,
+        "trade_expression": trade_expression,
+    }
+
+
+def main():
+    st.title("BTC Polymarket Deribit Scanner vNext")
+    st.caption(
+        "Uses sided pricing on Polymarket and Deribit, adds a $10,000 notional framework, "
+        "and generates executable trade expressions. Ranking remains a proxy until a full "
+        "terminal-event payoff model is added."
+    )
+
+    with st.sidebar:
+        st.header("Filters")
+        notional_usd = st.number_input(
+            "USD notional for sizing",
+            min_value=1000.0,
+            value=DEFAULT_NOTIONAL_USD,
+            step=1000.0,
+        )
+        min_liquidity = st.number_input(
+            "Minimum liquidity", min_value=0.0, value=5000.0, step=1000.0
+        )
+        min_volume = st.number_input(
+            "Minimum volume", min_value=0.0, value=1000.0, step=1000.0
+        )
+        categories = st.multiselect(
+            "Contract type",
+            options=["Above/Over", "Below/Under", "Reach/Hit"],
+            default=["Above/Over", "Below/Under", "Reach/Hit"],
+        )
+        max_expiry_gap_days = st.slider(
+            "Max Deribit expiry gap (days)", min_value=1, max_value=30, value=10
+        )
+        max_strike_gap_pct = st.slider(
+            "Max Deribit strike gap (%)", min_value=1, max_value=50, value=15
+        )
+
+    with st.spinner("Loading Polymarket markets and order books..."):
+        poly_df = build_polymarket_df()
+
+    with st.spinner("Loading Deribit instruments and summaries..."):
+        deribit_df = build_deribit_df()
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Polymarket trigger markets", len(poly_df))
+    c2.metric("Deribit BTC options loaded", len(deribit_df))
+    c3.metric("Scanner timestamp UTC", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
+
+    if poly_df.empty:
+        st.warning("No BTC price-trigger Polymarket markets found.")
+        return
+
+    matches = poly_df.apply(lambda row: pd.Series(find_best_deribit_match(row, deribit_df)), axis=1)
+    scanner_df = pd.concat([poly_df, matches], axis=1)
+
+    scanner_df = scanner_df[
+        scanner_df["category"].isin(categories)
+        & (scanner_df["liquidity"].fillna(0) >= min_liquidity)
+        & (scanner_df["volume"].fillna(0) >= min_volume)
+    ].copy()
+
+    scanner_df = scanner_df[
+        scanner_df["expiry_gap_days"].fillna(9999) <= max_expiry_gap_days
+    ].copy()
+
+    scanner_df = scanner_df[
+        scanner_df["strike_gap_pct"].fillna(9999) <= max_strike_gap_pct
+    ].copy()
+
+    if scanner_df.empty:
+        st.info("No rows passed the current filters.")
+        return
+
+    metrics = scanner_df.apply(
+        lambda row: pd.Series(compute_trade_metrics(row, notional_usd)),
+        axis=1,
+    )
+    scanner_df = pd.concat([scanner_df, metrics], axis=1)
+
+    scanner_df = scanner_df[scanner_df["poly_entry_price"].notna()].copy()
+    scanner_df = scanner_df[scanner_df["deribit_entry_price_btc"].notna()].copy()
+
+    if scanner_df.empty:
+        st.info("No rows have both executable Polymarket and Deribit sided prices.")
+        return
+
+    scanner_df["rank_score"] = (
+        scanner_df["payoff_probability_proxy"].fillna(-999) * 1000
+        + scanner_df["poly_net_payoff_usd_for_10k"].fillna(-999999) / 100
+        - scanner_df["match_score"].fillna(9999) * 5
+        + scanner_df["liquidity"].fillna(0) / 100000
+        + scanner_df["volume"].fillna(0) / 100000
+    )
+
+    scanner_df = scanner_df.sort_values(
+        by=["rank_score", "payoff_probability_proxy", "poly_net_payoff_usd_for_10k"],
+        ascending=[False, False, False],
+    ).reset_index(drop=True)
+
+    st.subheader("Top executable opportunities")
+
+    top_display = scanner_df.head(15)[
+        [
+            "question",
+            "category",
+            "poly_side",
+            "poly_entry_price",
+            "poly_shares_for_10k",
+            "poly_net_payoff_usd_for_10k",
+            "deribit_side",
+            "matched_instrument",
+            "deribit_entry_price_btc",
+            "deribit_contracts_for_10k",
+            "payoff_probability_proxy",
+            "trade_expression",
+        ]
+    ].copy()
+
+    top_display["poly_entry_price"] = top_display["poly_entry_price"].map(
+        lambda x: f"{x:.3f}" if pd.notna(x) else ""
+    )
+    top_display["poly_shares_for_10k"] = top_display["poly_shares_for_10k"].map(
+        lambda x: f"{x:,.0f}" if pd.notna(x) else ""
+    )
+    top_display["poly_net_payoff_usd_for_10k"] = top_display["poly_net_payoff_usd_for_10k"].map(
+        lambda x: f"${x:,.0f}" if pd.notna(x) else ""
+    )
+    top_display["deribit_entry_price_btc"] = top_display["deribit_entry_price_btc"].map(
+        lambda x: f"{x:.4f}" if pd.notna(x) else ""
+    )
+    top_display["deribit_contracts_for_10k"] = top_display["deribit_contracts_for_10k"].map(
+        lambda x: f"{x:.4f}" if pd.notna(x) else ""
+    )
+    top_display["payoff_probability_proxy"] = top_display["payoff_probability_proxy"].map(
+        lambda x: f"{x:.1%}" if pd.notna(x) else ""
+    )
+
+    st.dataframe(top_display, use_container_width=True, hide_index=True)
+
+    st.subheader("Full scanner table")
+
+    display = scanner_df[
+        [
+            "question",
+            "category",
+            "strike",
+            "end_date",
+            "poly_yes_bid",
+            "poly_yes_ask",
+            "poly_no_bid",
+            "poly_no_ask",
+            "poly_side",
+            "poly_entry_price",
+            "poly_shares_for_10k",
+            "poly_net_payoff_usd_for_10k",
+            "matched_instrument",
+            "matched_option_type",
+            "matched_expiry",
+            "matched_strike",
+            "deribit_bid",
+            "deribit_ask",
+            "deribit_side",
+            "deribit_entry_price_btc",
+            "deribit_contracts_for_10k",
+            "payoff_probability_proxy",
+            "expiry_gap_days",
+            "strike_gap_pct",
+            "liquidity",
+            "volume",
+            "trade_expression",
+        ]
+    ].copy()
+
+    display["strike"] = display["strike"].map(lambda x: f"${x:,.0f}" if pd.notna(x) else "")
+    display["poly_yes_bid"] = display["poly_yes_bid"].map(lambda x: f"{x:.3f}" if pd.notna(x) else "")
+    display["poly_yes_ask"] = display["poly_yes_ask"].map(lambda x: f"{x:.3f}" if pd.notna(x) else "")
+    display["poly_no_bid"] = display["poly_no_bid"].map(lambda x: f"{x:.3f}" if pd.notna(x) else "")
+    display["poly_no_ask"] = display["poly_no_ask"].map(lambda x: f"{x:.3f}" if pd.notna(x) else "")
+    display["poly_entry_price"] = display["poly_entry_price"].map(lambda x: f"{x:.3f}" if pd.notna(x) else "")
+    display["poly_shares_for_10k"] = display["poly_shares_for_10k"].map(
+        lambda x: f"{x:,.0f}" if pd.notna(x) else ""
+    )
+    display["poly_net_payoff_usd_for_10k"] = display["poly_net_payoff_usd_for_10k"].map(
+        lambda x: f"${x:,.0f}" if pd.notna(x) else ""
+    )
+    display["matched_strike"] = display["matched_strike"].map(
+        lambda x: f"${x:,.0f}" if pd.notna(x) else ""
+    )
+    display["deribit_bid"] = display["deribit_bid"].map(lambda x: f"{x:.4f}" if pd.notna(x) else "")
+    display["deribit_ask"] = display["deribit_ask"].map(lambda x: f"{x:.4f}" if pd.notna(x) else "")
+    display["deribit_entry_price_btc"] = display["deribit_entry_price_btc"].map(
+        lambda x: f"{x:.4f}" if pd.notna(x) else ""
+    )
+    display["deribit_contracts_for_10k"] = display["deribit_contracts_for_10k"].map(
+        lambda x: f"{x:.4f}" if pd.notna(x) else ""
+    )
+    display["payoff_probability_proxy"] = display["payoff_probability_proxy"].map(
+        lambda x: f"{x:.1%}" if pd.notna(x) else ""
+    )
+    display["expiry_gap_days"] = display["expiry_gap_days"].map(
+        lambda x: f"{x:.1f}" if pd.notna(x) else ""
+    )
+    display["strike_gap_pct"] = display["strike_gap_pct"].map(
+        lambda x: f"{x:.1f}%" if pd.notna(x) else ""
+    )
+    display["liquidity"] = display["liquidity"].map(lambda x: f"{x:,.0f}" if pd.notna(x) else "")
+    display["volume"] = display["volume"].map(lambda x: f"{x:,.0f}" if pd.notna(x) else "")
+    display["end_date"] = pd.to_datetime(
+        display["end_date"], utc=True, errors="coerce"
+    ).dt.strftime("%Y-%m-%d %H:%M UTC")
+    display["matched_expiry"] = pd.to_datetime(
+        display["matched_expiry"], utc=True, errors="coerce"
+    ).dt.strftime("%Y-%m-%d %H:%M UTC")
+
+    st.dataframe(display, use_container_width=True, hide_index=True)
+
+    st.subheader("Method notes")
+    st.markdown(
+        """
+- Polymarket uses YES/NO outcome tokens for binary questions, and order books are queried by token ID.
+- The app uses executable sided prices from Polymarket order books and Deribit option bid/ask fields instead of midpoint pricing.
+- BTC inverse options on Deribit use a 1 BTC contract size, so the sizing field is expressed in BTC notional terms.
+- The $10,000 payoff column is currently a binary-contract-style payoff proxy for the Polymarket leg.
+- Ranking is still a proxy and should be upgraded later to a true event-aligned terminal payoff model for the Deribit leg.
+        """
+    )
+
+
+if __name__ == "__main__":
+    main()
