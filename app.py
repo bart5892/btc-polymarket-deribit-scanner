@@ -317,7 +317,10 @@ def main():
         st.warning("No BTC price-trigger Polymarket markets found.")
         return
 
-    matches = poly_df.apply(lambda row: pd.Series(find_best_deribit_match(row, deribit_df)), axis=1)
+    matches = poly_df.apply(
+        lambda row: pd.Series(find_best_deribit_match(row, deribit_df)),
+        axis=1,
+    )
     scanner_df = pd.concat([poly_df, matches], axis=1)
 
     scanner_df = scanner_df[
@@ -330,4 +333,104 @@ def main():
         scanner_df["expiry_gap_days"].fillna(9999) <= max_expiry_gap_days
     ].copy()
 
-    scanner_df = 
+    scanner_df = scanner_df[
+        scanner_df["strike_gap_pct"].fillna(9999) <= max_strike_gap_pct
+    ].copy()
+
+    if scanner_df.empty:
+        st.info("No rows passed the current filters.")
+        return
+
+    scanner_df["proxy_gap"] = scanner_df["deribit_mid"] - scanner_df["yes_mid"]
+    scanner_df["rank_score"] = (
+        scanner_df["proxy_gap"].fillna(-999) * 100
+        + scanner_df["liquidity"].fillna(0) / 100000
+        + scanner_df["volume"].fillna(0) / 100000
+        - scanner_df["match_score"].fillna(9999) / 100
+    )
+
+    scanner_df = scanner_df.sort_values(
+        by=["rank_score", "liquidity", "volume"],
+        ascending=[False, False, False],
+    ).reset_index(drop=True)
+
+    st.subheader("Scanner table")
+
+    display = scanner_df[
+        [
+            "question",
+            "category",
+            "strike",
+            "end_date",
+            "yes_mid",
+            "matched_instrument",
+            "matched_option_type",
+            "matched_expiry",
+            "matched_strike",
+            "deribit_mid",
+            "proxy_gap",
+            "expiry_gap_days",
+            "strike_gap_pct",
+            "liquidity",
+            "volume",
+            "market_slug",
+        ]
+    ].copy()
+
+    display["strike"] = display["strike"].map(lambda x: f"${x:,.0f}" if pd.notna(x) else "")
+    display["yes_mid"] = display["yes_mid"].map(lambda x: f"{x:.2%}" if pd.notna(x) else "")
+    display["matched_strike"] = display["matched_strike"].map(
+        lambda x: f"${x:,.0f}" if pd.notna(x) else ""
+    )
+    display["deribit_mid"] = display["deribit_mid"].map(
+        lambda x: f"{x:.4f}" if pd.notna(x) else ""
+    )
+    display["proxy_gap"] = display["proxy_gap"].map(
+        lambda x: f"{x:+.4f}" if pd.notna(x) else ""
+    )
+    display["expiry_gap_days"] = display["expiry_gap_days"].map(
+        lambda x: f"{x:.1f}" if pd.notna(x) else ""
+    )
+    display["strike_gap_pct"] = display["strike_gap_pct"].map(
+        lambda x: f"{x:.1f}%" if pd.notna(x) else ""
+    )
+    display["liquidity"] = display["liquidity"].map(
+        lambda x: f"{x:,.0f}" if pd.notna(x) else ""
+    )
+    display["volume"] = display["volume"].map(
+        lambda x: f"{x:,.0f}" if pd.notna(x) else ""
+    )
+    display["end_date"] = pd.to_datetime(
+        display["end_date"], utc=True, errors="coerce"
+    ).dt.strftime("%Y-%m-%d %H:%M UTC")
+    display["matched_expiry"] = pd.to_datetime(
+        display["matched_expiry"], utc=True, errors="coerce"
+    ).dt.strftime("%Y-%m-%d %H:%M UTC")
+
+    st.dataframe(display, use_container_width=True, hide_index=True)
+
+    st.subheader("Method notes")
+    st.markdown(
+        '''
+- Polymarket yes mid comes from the Yes outcome price in the public Gamma market payload.
+- Deribit match uses live BTC option instruments and summary data, then selects the nearest expiry and strike candidate after matching calls to above/reach contracts and puts to below contracts.
+- Proxy gap is only a temporary comparison metric. It is not yet a true terminal digital probability edge.
+- The next version should replace this proxy with a modeled terminal probability from Deribit options around the event expiry and strike.
+        '''
+    )
+
+    st.subheader("Top opportunities snapshot")
+    top = scanner_df.head(10)[
+        ["question", "category", "yes_mid", "deribit_mid", "proxy_gap", "liquidity", "volume"]
+    ].copy()
+    top["yes_mid"] = top["yes_mid"].map(lambda x: f"{x:.2%}" if pd.notna(x) else "")
+    top["deribit_mid"] = top["deribit_mid"].map(lambda x: f"{x:.4f}" if pd.notna(x) else "")
+    top["proxy_gap"] = top["proxy_gap"].map(lambda x: f"{x:+.4f}" if pd.notna(x) else "")
+    top["liquidity"] = top["liquidity"].map(lambda x: f"{x:,.0f}" if pd.notna(x) else "")
+    top["volume"] = top["volume"].map(lambda x: f"{x:,.0f}" if pd.notna(x) else "")
+
+    st.dataframe(top, use_container_width=True, hide_index=True)
+
+
+if __name__ == "__main__":
+    main()
